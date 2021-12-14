@@ -51,11 +51,13 @@ func (runResult *RunResult) AppendError(err error, value string) {
 }
 
 func (runResult *RunResult) PrintAll(writer io.Writer) {
-	for _, item := range runResult.Lines {
-		writer.Write([]byte(item.Value))
-		writer.Write([]byte("\n"))
-		if item.Error != nil {
-			writer.Write([]byte(item.Error.Error()))
+	if runResult != nil && len(runResult.Lines) > 0 {
+		for _, item := range runResult.Lines {
+			writer.Write([]byte(item.Value))
+			writer.Write([]byte("\n"))
+			if item.Error != nil {
+				writer.Write([]byte(item.Error.Error()))
+			}
 		}
 	}
 }
@@ -76,16 +78,56 @@ func (app *App) RunDir(dir string) (*RunResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	cntUnique := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".cpp") {
+			cntUnique++
+		}
+	}
 	for _, entry := range entries {
 		if strings.HasSuffix(entry.Name(), ".cpp") {
 			res, err := app.Run(filepath.Join(dir, entry.Name()))
-			if err != nil {
-				result.Append(RED + "FAILED" + NC + " " + entry.Name())
+			line := ""
+			if cntUnique > 1 {
+				line += entry.Name() + " "
 			} else {
-				result.Append(GREEN + "PASSED" + NC + " " + entry.Name() + " Tests " + strconv.Itoa(res.TestsPassed))
+				line += dir + " "
 			}
+			if err != nil {
+				line += RED + "FAILED" + NC
+			} else {
+				if res.TestsPassed > 0 {
+					line += GREEN + "PASSED" + NC + " " + strconv.Itoa(res.TestsPassed) + " "
+				}
+				if res.TestsFailed > 0 {
+					line += RED + "FAILED" + NC + " " + strconv.Itoa(res.TestsFailed) + " "
+				}
+			}
+			result.Append(line)
 		}
 	}
+	return result, nil
+}
+
+func (app *App) RunOne(filename string, input string) (*RunResult, error) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	uid := strconv.Itoa(r.Intn(1_000_000_000))
+	binaryFilename := filepath.Join(os.TempDir(), "test"+uid)
+	result := &RunResult{}
+	defer os.Remove(binaryFilename)
+	err := app.CompileSource(filename, binaryFilename)
+	if err != nil {
+		result.AppendError(err, fmt.Sprintf("%scompile failed%s: %s", RED, NC, filename))
+		return result, err
+	}
+	result.Compiled = true
+	result.Append(fmt.Sprint(filename, " compiled"))
+	res, err := app.executeCode(binaryFilename, input)
+	if err != nil {
+		log.Println("Execution failed:", err)
+		log.Println(res)
+	}
+	fmt.Println(res)
 	return result, nil
 }
 
@@ -102,7 +144,6 @@ func (app *App) Run(filename string) (*RunResult, error) {
 		return result, err
 	}
 	result.Compiled = true
-	result.Append(fmt.Sprint(filename, " compiled"))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return result, err
@@ -112,24 +153,32 @@ func (app *App) Run(filename string) (*RunResult, error) {
 			continue
 		}
 		input := filepath.Join(dir, entry.Name())
-		result.Append(fmt.Sprint("run ", filepath.Base(filename), " ", entry.Name()))
+		start := time.Now()
 		res, err := app.executeCode(binaryFilename, input)
 		if err != nil {
 			log.Println("Execution failed:", err)
 			log.Println(res)
 			continue
 		}
+		duration := time.Since(start)
+		elaTime := strconv.FormatInt(duration.Milliseconds(), 10) + "ms"
 		name := strings.TrimSuffix(entry.Name(), ".in")
 		output := filepath.Join(dir, name+".out")
 		if _, err := os.Stat(output); err == nil {
 			if app.ValidateOutput(res, output) {
-				result.Append(GREEN + "PASSED" + NC)
+				result.Append(GREEN + "PASSED" + NC + " " + name + " " + elaTime)
 				result.TestsPassed++
+				// dumpString("ex", a1)
 			} else {
-				result.Append(RED + "FAILED" + NC)
+				result.Append(RED + "FAILED" + NC + " " + name + " " + elaTime)
 				result.TestsFailed++
+				result.Append(res)
 			}
+		} else {
+			result.Append(res)
+			result.Append("elapsed time " + elaTime)
 		}
+		// fmt.Println(res)
 	}
 	return result, nil
 }
@@ -140,24 +189,25 @@ func dumpString(prefix string, a []string) {
 	}
 }
 
+func cleanOutput(s string) []string {
+	res := make([]string, 0)
+	a := strings.Split(s, "\n")
+	for i := 0; i < len(a); i++ {
+		str := strings.TrimSpace(a[i])
+		if len(str) != 0 {
+			res = append(res, str)
+		}
+	}
+	return res
+}
 func compareString(s1, s2 string) bool {
-	a1 := strings.Split(s1, "\n")
-	a2 := strings.Split(s2, "\n")
-	for i := 0; i < len(a1); i++ {
-		a1[i] = strings.TrimSpace(a1[i])
-	}
-	for i := 0; i < len(a2); i++ {
-		a2[i] = strings.TrimSpace(a2[i])
-	}
+	a1 := cleanOutput(s1)
+	a2 := cleanOutput(s2)
 	if len(a1) != len(a2) {
-		dumpString("ex", a1)
-		dumpString("real", a2)
 		return false
 	}
 	for i := 0; i < len(a1); i++ {
 		if a1[i] != a2[i] {
-			dumpString("ex", a1)
-			dumpString("real", a2)
 			return false
 		}
 	}
@@ -173,7 +223,7 @@ func (e *CompileError) Error() string {
 }
 
 func (app *App) CompileSource(filename string, binaryFilename string) error {
-	args := fmt.Sprintf("-std=c++17 -O2 -Wall %s -o %s", filename, binaryFilename)
+	args := fmt.Sprintf("-std=c++17 -O2 -DLOCAL -Wall %s -o %s", filename, binaryFilename)
 	ctx, cancel := context.WithTimeout(context.Background(), 5000*time.Millisecond)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "g++", strings.Split(args, " ")...)
