@@ -221,14 +221,13 @@ type CompileError struct {
 func (e *CompileError) Error() string {
 	return fmt.Sprint(e.Message)
 }
-
 func (app *App) CompileSource(filename string, binaryFilename string) error {
-	args := fmt.Sprintf("-std=c++17 -O2 -DLOCAL -Wall %s -o %s", filename, binaryFilename)
+	args := fmt.Sprintf("-std=c++17 -g -fsanitize=address -fno-omit-frame-pointer -O2 -DLOCAL -Wall %s -o %s", filename, binaryFilename)
 	ctx, cancel := context.WithTimeout(context.Background(), 5000*time.Millisecond)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "g++", strings.Split(args, " ")...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return &CompileError{Message: string(out)}
+		return &CompileError{Message: err.Error() + "\n" + string(out)}
 	}
 	return nil
 }
@@ -241,6 +240,14 @@ func (app *App) executeCode(binaryFilename string, filenameInput string) (string
 	if err != nil {
 		log.Fatal(err)
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
 	go func() {
 		defer stdin.Close()
 		file, err := os.Open(filenameInput)
@@ -250,9 +257,16 @@ func (app *App) executeCode(binaryFilename string, filenameInput string) (string
 		}
 		io.Copy(stdin, file)
 	}()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", err
+	if err = cmd.Start(); err != nil {
+		log.Fatal(err)
 	}
-	return string(out), nil
+	slurp, _ := io.ReadAll(stderr)
+	if len(slurp) > 0 {
+		fmt.Printf("%s\n", slurp)
+	}
+	out, _ := io.ReadAll(stdout)
+	if err := cmd.Wait(); err != nil {
+		log.Printf("running program is killed = %+v", err)
+	}
+	return string(out), err
 }
